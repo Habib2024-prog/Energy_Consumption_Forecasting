@@ -8,7 +8,6 @@ __pycache__/
 
 # Folders to ignore
 data/
-models/
 outputs/
 notebooks/
 .vscode/
