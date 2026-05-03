@@ -1,9 +1,6 @@
+streamlit
 pandas
 numpy
 scikit-learn
-tensorflow==2.15.0
-matplotlib
-seaborn
 plotly
-streamlit
-ucimlrepo
+joblib
