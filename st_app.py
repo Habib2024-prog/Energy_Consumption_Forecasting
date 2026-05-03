@@ -5,225 +5,560 @@ import plotly.graph_objects as go
 import plotly.express as px
 import pickle
 import warnings
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore")
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-# ==============================
-# SAFE TENSORFLOW IMPORT (IMPORTANT)
-# ==============================
-try:
-    from tensorflow.keras.models import load_model
-    TF_AVAILABLE = True
-except:
-    TF_AVAILABLE = False
-    load_model = None
-
-
-# ==============================
-# PAGE CONFIG
-# ==============================
+# ── Page config ──────────────────────────────────────────────
 st.set_page_config(
     page_title="Energy Consumption Forecasting",
     page_icon="⚡",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("⚡ Energy Consumption Forecasting Dashboard")
+# ── Custom CSS ────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #1F5C99;
+        text-align: center;
+        margin-bottom: 0.2rem;
+    }
+    .sub-header {
+        font-size: 1rem;
+        color: #666;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background: #f8f9fa;
+        border-radius: 10px;
+        padding: 1rem;
+        border-left: 4px solid #1F5C99;
+        margin-bottom: 1rem;
+    }
+    .section-title {
+        font-size: 1.2rem;
+        font-weight: 600;
+        color: #1F5C99;
+        border-bottom: 2px solid #1F5C99;
+        padding-bottom: 0.3rem;
+        margin-bottom: 1rem;
+    }
+    .winner-badge {
+        background: #1D9E75;
+        color: white;
+        padding: 0.2rem 0.8rem;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-if not TF_AVAILABLE:
-    st.warning("LSTM model disabled (TensorFlow not available), but app works fully.")
-
-
-# ==============================
-# LOAD FILES
-# ==============================
+# ── Load all assets (cached) ──────────────────────────────────
 @st.cache_resource
-def load_models():
-    scaler_X = pickle.load(open("models/scaler_X.pkl", "rb"))
-    scaler_Y = pickle.load(open("models/scaler_Y.pkl", "rb"))
-    feature_cols = pickle.load(open("models/feature_cols.pkl", "rb"))
+def load_all_assets():
+    with open('models/scaler_X.pkl', 'rb') as f:
+        scaler_X = pickle.load(f)
+    with open('models/scaler_Y.pkl', 'rb') as f:
+        scaler_Y = pickle.load(f)
+    with open('models/feature_cols.pkl', 'rb') as f:
+        feature_cols = pickle.load(f)
+    with open('models/ridge_model.pkl', 'rb') as f:
+        ridge = pickle.load(f)
+    with open('models/rf_model.pkl', 'rb') as f:
+        rf_model = pickle.load(f)
 
-    ridge = pickle.load(open("models/ridge_model.pkl", "rb"))
-    rf = pickle.load(open("models/rf_model.pkl", "rb"))
+    # Load the lightweight sequential model (replaces LSTM)
+    # This is a GradientBoostingRegressor trained with lag features
+    with open('models/seq_model.pkl', 'rb') as f:
+        seq_model = pickle.load(f)
 
-    lstm = None
-    if TF_AVAILABLE:
-        try:
-            lstm = load_model("models/lstm_model.keras")
-        except:
-            lstm = None
+    with open('models/lstm_config.pkl', 'rb') as f:
+        lstm_config = pickle.load(f)
 
-    return scaler_X, scaler_Y, feature_cols, ridge, rf, lstm
+    results_df = pd.read_csv('outputs/results_full.csv', index_col=0)
+
+    return (scaler_X, scaler_Y, feature_cols,
+            ridge, rf_model, seq_model,
+            lstm_config, results_df)
 
 
 @st.cache_data
 def load_data():
-    train = pd.read_csv("data/processed/train.csv")
-    test = pd.read_csv("data/processed/test.csv")
+    train_df = pd.read_csv('data/processed/train.csv')
+    test_df  = pd.read_csv('data/processed/test.csv')
+    df = pd.concat([train_df, test_df]).reset_index(drop=True)
+    df['date'] = pd.to_datetime(df['date'])
+    return df, train_df, test_df
 
-    df = pd.concat([train, test]).reset_index(drop=True)
-    df["date"] = pd.to_datetime(df["date"])
-    return df, train, test
+
+def make_lag_features(X_scaled, window_size):
+    """
+    Replaces LSTM sequence creation.
+    For each row i (>= window_size), flatten the previous `window_size`
+    rows of X into a single feature vector — same information, no TF needed.
+    """
+    rows = []
+    for i in range(window_size, len(X_scaled)):
+        window = X_scaled[i - window_size:i].ravel()
+        rows.append(window)
+    return np.array(rows)
 
 
-scaler_X, scaler_Y, feature_cols, ridge, rf, lstm = load_models()
+# ── Load everything ───────────────────────────────────────────
+(scaler_X, scaler_Y, feature_cols,
+ ridge, rf_model, seq_model,
+ lstm_config, results_df) = load_all_assets()
+
 df, train_df, test_df = load_data()
 
-
-# ==============================
-# SIDEBAR FILTERS
-# ==============================
-st.sidebar.header("Filters")
-
-model_choice = st.sidebar.selectbox(
-    "Select Model",
-    ["Random Forest", "Ridge Regression", "All Models"]
-)
-
-test_dates = pd.to_datetime(test_df["date"])
-min_date = test_dates.min().date()
-max_date = test_dates.max().date()
-
-start_date = st.sidebar.date_input("Start Date", min_date)
-end_date = st.sidebar.date_input("End Date", max_date)
-
-n_points = st.sidebar.slider("Points to Show", 100, 1000, 400)
+X_test_2d = scaler_X.transform(test_df[feature_cols])
+y_test_2d = scaler_Y.transform(test_df[['Appliances']])
+WINDOW_SIZE = lstm_config['window_size']
 
 
-# ==============================
-# FILTER DATA
-# ==============================
-mask = (
-    (pd.to_datetime(test_df["date"]).dt.date >= start_date) &
-    (pd.to_datetime(test_df["date"]).dt.date <= end_date)
-)
+# ═══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═══════════════════════════════════════════════════════════════
+with st.sidebar:
+    try:
+        st.image("logo2.png", width=60)
+    except Exception:
+        pass
+    st.markdown("## Energy Forecasting")
+    st.markdown("**CS-245 ML + DS-401 Project**")
+    st.markdown("---")
 
-filtered = test_df[mask]
-
-X_test = scaler_X.transform(filtered[feature_cols])
-y_test = scaler_Y.transform(filtered[["Appliances"]])
-y_true = scaler_Y.inverse_transform(y_test).ravel()
-
-
-# ==============================
-# TABS (YOUR ORIGINAL STRUCTURE)
-# ==============================
-tab1, tab2, tab3 = st.tabs(["📊 EDA", "🔮 Predictions", "📁 Dataset Info"])
-
-
-# =========================================================
-# TAB 1 — EDA
-# =========================================================
-with tab1:
-    st.subheader("📊 Exploratory Data Analysis")
-
-    # Line plot
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df["date"],
-        y=df["Appliances"],
-        mode="lines",
-        name="Energy Usage"
-    ))
-
-    fig.update_layout(
-        title="Energy Consumption Over Time",
-        xaxis_title="Date",
-        yaxis_title="Energy (Wh)"
+    st.markdown("### 🔧 Settings")
+    selected_model = st.selectbox(
+        "Select Model",
+        ["Random Forest", "Sequential (GBR)", "Ridge Regression", "All Models"],
+        index=0
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("---")
+    st.markdown("### 📅 Date Range (Test Set)")
+    test_dates = pd.to_datetime(test_df['date'])
+    min_date = test_dates.min().date()
+    max_date = test_dates.max().date()
+
+    date_start = st.date_input("From", value=min_date,
+                               min_value=min_date, max_value=max_date)
+    date_end   = st.date_input("To",   value=max_date,
+                               min_value=min_date, max_value=max_date)
+
+    n_points = st.slider("Points to display", 100, 1000, 400, 50)
+
+    st.markdown("---")
+    st.markdown("### 📊 Display Options")
+    show_residuals   = st.checkbox("Show Residual Plot",       value=True)
+    show_cluster     = st.checkbox("Show Cluster Analysis",    value=True)
+    show_feature_imp = st.checkbox("Show Feature Importance (RF)", value=True)
+
+    st.markdown("---")
+    st.markdown("**Dataset:** UCI Appliances Energy")
+    st.markdown("**Samples:** 19,735 | **Interval:** 10 min")
 
 
-    # Hourly pattern
-    st.subheader("⏰ Hourly Pattern")
-
-    df["hour"] = df["date"].dt.hour
-    hourly = df.groupby("hour")["Appliances"].mean().reset_index()
-
-    fig2 = px.bar(hourly, x="hour", y="Appliances")
-    st.plotly_chart(fig2, use_container_width=True)
-
-
-    # Distribution
-    st.subheader("📦 Distribution")
-
-    fig3 = px.histogram(df, x="Appliances", nbins=50)
-    st.plotly_chart(fig3, use_container_width=True)
+# ═══════════════════════════════════════════════════════════════
+# HEADER
+# ═══════════════════════════════════════════════════════════════
+st.markdown('<div class="main-header">⚡ Appliances Energy Consumption Forecasting</div>',
+            unsafe_allow_html=True)
+st.markdown('<div class="sub-header">UCI Dataset · Machine Learning & Data Science Project · CS-245 + DS-401</div>',
+            unsafe_allow_html=True)
 
 
-# =========================================================
-# TAB 2 — PREDICTIONS
-# =========================================================
-with tab2:
-    st.subheader("🔮 Model Predictions vs Actual")
+# ═══════════════════════════════════════════════════════════════
+# TAB LAYOUT
+# ═══════════════════════════════════════════════════════════════
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🏠 Overview",
+    "🔮 Predictions",
+    "📊 Model Comparison",
+    "🔍 EDA Insights",
+    "📋 Project Info"
+])
 
+
+# ───────────────────────────────────────────────────────────────
+# TAB 1 — OVERVIEW
+# ───────────────────────────────────────────────────────────────
+with tab1:
+    st.markdown('<div class="section-title">Dataset Overview</div>',
+                unsafe_allow_html=True)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Records",   f"{len(df):,}")
+    col2.metric("Avg Energy (Wh)", f"{df['Appliances'].mean():.1f}")
+    col3.metric("Max Energy (Wh)", f"{df['Appliances'].max():.1f}")
+    col4.metric("Features Used",   f"{len(feature_cols)}")
+
+    st.markdown("---")
+
+    st.markdown('<div class="section-title">Full Energy Consumption Timeline</div>',
+                unsafe_allow_html=True)
     fig = go.Figure()
-
     fig.add_trace(go.Scatter(
-        y=y_true[:n_points],
-        mode="lines",
-        name="Actual"
+        x=df['date'], y=df['Appliances'],
+        mode='lines', name='Appliances (Wh)',
+        line=dict(color='#1F5C99', width=0.8),
+        fill='tozeroy', fillcolor='rgba(31,92,153,0.08)'
     ))
-
-    # RF
-    if model_choice in ["Random Forest", "All Models"]:
-        rf_pred = rf.predict(X_test)
-        rf_pred = scaler_Y.inverse_transform(rf_pred.reshape(-1, 1)).ravel()
-
-        fig.add_trace(go.Scatter(
-            y=rf_pred[:n_points],
-            mode="lines",
-            name="Random Forest"
-        ))
-
-    # Ridge
-    if model_choice in ["Ridge Regression", "All Models"]:
-        ridge_pred = ridge.predict(X_test)
-        ridge_pred = scaler_Y.inverse_transform(ridge_pred.reshape(-1, 1)).ravel()
-
-        fig.add_trace(go.Scatter(
-            y=ridge_pred[:n_points],
-            mode="lines",
-            name="Ridge"
-        ))
-
+    fig.add_vrect(
+        x0=train_df['date'].max(), x1=test_df['date'].max(),
+        fillcolor='rgba(29,158,117,0.08)',
+        annotation_text="Test Period",
+        annotation_position="top left",
+        line_width=0
+    )
+    fig.update_layout(
+        title='Energy Consumption Over Time',
+        xaxis_title='Date', yaxis_title='Energy (Wh)',
+        height=350, showlegend=True,
+        plot_bgcolor='white', paper_bgcolor='white'
+    )
     st.plotly_chart(fig, use_container_width=True)
 
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="section-title">Avg Energy by Hour</div>',
+                    unsafe_allow_html=True)
+        hourly = df.groupby(df['date'].dt.hour)['Appliances'].mean()
+        fig2 = go.Figure(go.Scatter(
+            x=hourly.index, y=hourly.values,
+            mode='lines+markers',
+            line=dict(color='#1F5C99', width=2),
+            fill='tozeroy', fillcolor='rgba(31,92,153,0.1)'
+        ))
+        fig2.update_layout(height=300,
+                           xaxis_title='Hour', yaxis_title='Avg Energy (Wh)',
+                           plot_bgcolor='white', paper_bgcolor='white')
+        st.plotly_chart(fig2, use_container_width=True)
 
-    # Metrics
-    st.subheader("📌 Metrics")
-
-    def rmse(y_true, y_pred):
-        return np.sqrt(np.mean((y_true - y_pred) ** 2))
-
-    metrics = {}
-
-    rf_pred = rf.predict(X_test)
-    rf_pred = scaler_Y.inverse_transform(rf_pred.reshape(-1, 1)).ravel()
-    metrics["Random Forest RMSE"] = rmse(y_true, rf_pred)
-
-    ridge_pred = ridge.predict(X_test)
-    ridge_pred = scaler_Y.inverse_transform(ridge_pred.reshape(-1, 1)).ravel()
-    metrics["Ridge RMSE"] = rmse(y_true, ridge_pred)
-
-    st.write(metrics)
+    with col2:
+        st.markdown('<div class="section-title">Avg Energy by Day of Week</div>',
+                    unsafe_allow_html=True)
+        days  = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        daily = df.groupby(df['date'].dt.dayofweek)['Appliances'].mean()
+        colors_dow = ['#E05C4B' if i >= 5 else '#1F5C99' for i in range(7)]
+        fig3 = go.Figure(go.Bar(
+            x=days, y=daily.values, marker_color=colors_dow, opacity=0.85
+        ))
+        fig3.update_layout(height=300,
+                           xaxis_title='Day', yaxis_title='Avg Energy (Wh)',
+                           plot_bgcolor='white', paper_bgcolor='white')
+        st.plotly_chart(fig3, use_container_width=True)
 
 
-# =========================================================
-# TAB 3 — DATASET INFO
-# =========================================================
+# ───────────────────────────────────────────────────────────────
+# TAB 2 — PREDICTIONS
+# ───────────────────────────────────────────────────────────────
+with tab2:
+    st.markdown('<div class="section-title">Model Predictions vs Actual</div>',
+                unsafe_allow_html=True)
+
+    mask = ((pd.to_datetime(test_df['date']).dt.date >= date_start) &
+            (pd.to_datetime(test_df['date']).dt.date <= date_end))
+    filtered_test = test_df[mask].copy()
+
+    if len(filtered_test) < 50:
+        st.warning("Date range too small — please select a wider range.")
+    else:
+        X_filtered = scaler_X.transform(filtered_test[feature_cols])
+        y_filtered = scaler_Y.transform(filtered_test[['Appliances']])
+        y_true_f   = scaler_Y.inverse_transform(y_filtered).ravel()
+
+        model_colors = {
+            'Random Forest':       '#1F5C99',
+            'Sequential (GBR)':    '#1D9E75',
+            'Ridge Regression':    '#E07B39'
+        }
+
+        fig_pred = go.Figure()
+        fig_pred.add_trace(go.Scatter(
+            x=filtered_test['date'].values[:n_points],
+            y=y_true_f[:n_points],
+            mode='lines', name='Actual',
+            line=dict(color='#2E2E2E', width=1.5)
+        ))
+
+        models_to_run = (list(model_colors.keys())
+                         if selected_model == "All Models"
+                         else [selected_model])
+
+        metrics_live = {}
+        for m_name in models_to_run:
+            if m_name == 'Ridge Regression':
+                y_pred_s = ridge.predict(X_filtered)
+                y_pred   = scaler_Y.inverse_transform(y_pred_s.reshape(-1, 1)).ravel()
+                x_dates  = filtered_test['date'].values[:n_points]
+                y_plot   = y_pred[:n_points]
+                y_ref    = y_true_f
+
+            elif m_name == 'Random Forest':
+                y_pred_s = rf_model.predict(X_filtered)
+                y_pred   = scaler_Y.inverse_transform(y_pred_s.reshape(-1, 1)).ravel()
+                x_dates  = filtered_test['date'].values[:n_points]
+                y_plot   = y_pred[:n_points]
+                y_ref    = y_true_f
+
+            else:  # Sequential (GBR) — lag-feature based
+                if len(X_filtered) <= WINDOW_SIZE:
+                    st.warning("Not enough data points for Sequential model window. Select wider range.")
+                    continue
+                X_lag = make_lag_features(X_filtered, WINDOW_SIZE)
+                y_pred_s = seq_model.predict(X_lag)
+                y_pred   = scaler_Y.inverse_transform(y_pred_s.reshape(-1, 1)).ravel()
+                y_ref    = y_true_f[WINDOW_SIZE:]
+                x_dates  = filtered_test['date'].values[WINDOW_SIZE:WINDOW_SIZE + n_points]
+                y_plot   = y_pred[:n_points]
+
+            rmse = np.sqrt(mean_squared_error(y_ref[:len(y_pred)], y_pred[:len(y_ref)]))
+            mae  = mean_absolute_error(y_ref[:len(y_pred)], y_pred[:len(y_ref)])
+            metrics_live[m_name] = {'RMSE': rmse, 'MAE': mae}
+
+            fig_pred.add_trace(go.Scatter(
+                x=x_dates,
+                y=y_plot,
+                mode='lines', name=m_name,
+                line=dict(color=model_colors[m_name], width=1.2, dash='dash')
+            ))
+
+        fig_pred.update_layout(
+            title=f'Predicted vs Actual — {selected_model}',
+            xaxis_title='Date', yaxis_title='Energy (Wh)',
+            height=420, plot_bgcolor='white', paper_bgcolor='white',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02)
+        )
+        st.plotly_chart(fig_pred, use_container_width=True)
+
+        if metrics_live:
+            st.markdown('<div class="section-title">Live Metrics (Selected Range)</div>',
+                        unsafe_allow_html=True)
+            cols = st.columns(len(metrics_live))
+            for col, (m_name, m_vals) in zip(cols, metrics_live.items()):
+                col.metric(f"{m_name} — RMSE", f"{m_vals['RMSE']:.2f} Wh")
+                col.metric(f"{m_name} — MAE",  f"{m_vals['MAE']:.2f} Wh")
+
+        if show_residuals and 'Random Forest' in metrics_live:
+            st.markdown('<div class="section-title">Residual Plot</div>',
+                        unsafe_allow_html=True)
+            y_pred_rf_f = scaler_Y.inverse_transform(
+                rf_model.predict(X_filtered).reshape(-1, 1)).ravel()
+            residuals = y_true_f - y_pred_rf_f
+
+            fig_res = go.Figure()
+            fig_res.add_trace(go.Scatter(
+                y=residuals[:n_points], mode='lines',
+                line=dict(color='#1F5C99', width=0.8), name='Residuals'
+            ))
+            fig_res.add_hline(y=0, line_dash='dash', line_color='red')
+            fig_res.update_layout(
+                title='Random Forest Residuals',
+                yaxis_title='Residual (Wh)', height=280,
+                plot_bgcolor='white', paper_bgcolor='white'
+            )
+            st.plotly_chart(fig_res, use_container_width=True)
+
+
+# ───────────────────────────────────────────────────────────────
+# TAB 3 — MODEL COMPARISON
+# ───────────────────────────────────────────────────────────────
 with tab3:
-    st.subheader("📁 Dataset Information")
+    st.markdown('<div class="section-title">Full Model Comparison</div>',
+                unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns(3)
+    st.dataframe(
+        results_df.style
+            .highlight_min(subset=['RMSE', 'MAE', 'MAPE'], color='#d4edda')
+            .highlight_max(subset=['R2'],                   color='#d4edda')
+            .format({'RMSE': '{:.2f}', 'MAE': '{:.2f}',
+                     'MAPE': '{:.2f}%', 'R2': '{:.4f}'}),
+        use_container_width=True
+    )
 
-    col1.metric("Total Records", len(df))
-    col2.metric("Features", len(feature_cols))
-    col3.metric("Missing Values", df.isnull().sum().sum())
+    st.markdown("---")
+    col1, col2 = st.columns(2)
 
-    st.write(df.describe())
+    with col1:
+        st.markdown('<div class="section-title">RMSE Comparison</div>',
+                    unsafe_allow_html=True)
+        fig_rmse = go.Figure(go.Bar(
+            x=results_df.index,
+            y=results_df['RMSE'],
+            marker_color=['#E07B39', '#1F5C99', '#1D9E75'],
+            opacity=0.85, text=results_df['RMSE'].round(2),
+            textposition='outside'
+        ))
+        fig_rmse.update_layout(height=350, yaxis_title='RMSE (Wh)',
+                               plot_bgcolor='white', paper_bgcolor='white')
+        st.plotly_chart(fig_rmse, use_container_width=True)
 
-    st.subheader(" Sample Data")
-    st.dataframe(df.head(50))
+    with col2:
+        st.markdown('<div class="section-title">R² Score Comparison</div>',
+                    unsafe_allow_html=True)
+        fig_r2 = go.Figure(go.Bar(
+            x=results_df.index,
+            y=results_df['R2'],
+            marker_color=['#E07B39', '#1F5C99', '#1D9E75'],
+            opacity=0.85, text=results_df['R2'].round(4),
+            textposition='outside'
+        ))
+        fig_r2.update_layout(height=350, yaxis_title='R² Score',
+                             plot_bgcolor='white', paper_bgcolor='white')
+        st.plotly_chart(fig_r2, use_container_width=True)
+
+    if show_feature_imp:
+        st.markdown('<div class="section-title">Random Forest — Feature Importance</div>',
+                    unsafe_allow_html=True)
+        importances = rf_model.feature_importances_
+        indices     = np.argsort(importances)[::-1][:15]
+        top_feats   = [feature_cols[i] for i in indices]
+        top_imps    = importances[indices]
+
+        fig_imp = go.Figure(go.Bar(
+            x=top_imps[::-1], y=top_feats[::-1],
+            orientation='h',
+            marker_color=['#1F5C99' if i == len(top_feats) - 1
+                          else '#D6E4F0' for i in range(len(top_feats))],
+            opacity=0.9
+        ))
+        fig_imp.update_layout(
+            height=450, xaxis_title='Importance Score',
+            plot_bgcolor='white', paper_bgcolor='white'
+        )
+        st.plotly_chart(fig_imp, use_container_width=True)
+
+
+# ───────────────────────────────────────────────────────────────
+# TAB 4 — EDA INSIGHTS
+# ───────────────────────────────────────────────────────────────
+with tab4:
+    st.markdown('<div class="section-title">Exploratory Data Analysis</div>',
+                unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title">Energy Heatmap — Hour vs Day of Week</div>',
+                unsafe_allow_html=True)
+    df['hour']        = df['date'].dt.hour
+    df['day_of_week'] = df['date'].dt.dayofweek
+    pivot = df.pivot_table(values='Appliances',
+                           index='day_of_week', columns='hour', aggfunc='mean')
+    pivot.index = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+    fig_heat = px.imshow(
+        pivot, color_continuous_scale='YlOrRd',
+        labels=dict(x='Hour of Day', y='Day of Week', color='Avg Energy (Wh)'),
+        title='Average Energy Consumption Heatmap'
+    )
+    fig_heat.update_layout(height=350)
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="section-title">Energy Distribution</div>',
+                    unsafe_allow_html=True)
+        fig_dist = px.histogram(df, x='Appliances', nbins=80,
+                                color_discrete_sequence=['#1F5C99'],
+                                title='Distribution of Appliance Energy (Wh)')
+        fig_dist.update_layout(height=320, plot_bgcolor='white', paper_bgcolor='white')
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+    with col2:
+        if show_cluster and 'cluster' in df.columns:
+            st.markdown('<div class="section-title">K-Means Cluster Distribution</div>',
+                        unsafe_allow_html=True)
+            cluster_map = {0: 'Low Usage', 1: 'Medium Usage', 2: 'High Usage'}
+            df['cluster_label'] = df['cluster'].map(cluster_map)
+            cluster_counts = df['cluster_label'].value_counts()
+            fig_pie = px.pie(
+                values=cluster_counts.values,
+                names=cluster_counts.index,
+                color_discrete_sequence=['#1D9E75', '#1F5C99', '#E05C4B'],
+                title='Cluster Distribution'
+            )
+            fig_pie.update_layout(height=320)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.markdown('<div class="section-title">Top Feature Correlations with Target</div>',
+                unsafe_allow_html=True)
+    num_cols = df.select_dtypes(include=np.number).columns.tolist()
+    corr = df[num_cols].corr()['Appliances'].drop('Appliances').sort_values(key=abs, ascending=False)
+    colors_corr = ['#1D9E75' if v > 0 else '#E05C4B' for v in corr.values[:15]]
+
+    fig_corr = go.Figure(go.Bar(
+        x=corr.values[:15], y=corr.index[:15],
+        orientation='h', marker_color=colors_corr, opacity=0.85
+    ))
+    fig_corr.update_layout(
+        height=400, xaxis_title='Correlation Coefficient',
+        plot_bgcolor='white', paper_bgcolor='white',
+        yaxis=dict(autorange='reversed')
+    )
+    st.plotly_chart(fig_corr, use_container_width=True)
+
+
+# ───────────────────────────────────────────────────────────────
+# TAB 5 — PROJECT INFO
+# ───────────────────────────────────────────────────────────────
+with tab5:
+    st.markdown('<div class="section-title">Project Information</div>',
+                unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+        **📚 Courses**
+        - CS-245: Machine Learning
+        - DS-401: Introduction to Data Science
+
+        **📦 Dataset**
+        - UCI Appliances Energy Prediction
+        - ID: 374 | License: CC BY 4.0
+        - 19,735 rows | 10-min intervals | 4.5 months
+
+        **🧠 Models Implemented**
+        - Ridge Regression (baseline)
+        - Random Forest Regressor
+        - Sequential GBR (lag-feature time-series model)
+        - K-Means Clustering (unsupervised)
+        """)
+
+    with col2:
+        st.markdown("""
+        **🛠️ Tools & Libraries**
+        - Python, Pandas, NumPy
+        - Scikit-learn
+        - Matplotlib, Seaborn, Plotly
+        - Streamlit
+
+        **📊 Evaluation Metrics**
+        - RMSE — Root Mean Squared Error
+        - MAE  — Mean Absolute Error
+        - MAPE — Mean Absolute Percentage Error
+        - R²   — Coefficient of Determination
+
+        **🔗 Dataset Link**
+        - https://archive.ics.uci.edu/dataset/374
+        """)
+
+    st.markdown("---")
+    st.markdown('<div class="section-title">Critical Reflection</div>',
+                unsafe_allow_html=True)
+    try:
+        with open('outputs/critical_reflection.txt', 'r', encoding='utf-8', errors='ignore') as f:
+            reflection = f.read()
+        st.code(reflection, language=None)
+    except Exception as e:
+        st.error(f"Could not load reflection: {e}")
+
+    st.markdown("---")
+    st.markdown('<div class="section-title">Full Results Table</div>',
+                unsafe_allow_html=True)
+    st.dataframe(results_df, use_container_width=True)
