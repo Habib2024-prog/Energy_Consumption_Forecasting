@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# Large ML files
+*.npy
+*.keras
+*.pkl
+
+# Folders to ignore
+data/
+models/
+outputs/
+notebooks/
+.vscode/
