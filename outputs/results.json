@@ -1,0 +1,14 @@
+{
+    "Ridge Regression": {
+        "RMSE": 21.35,
+        "MAE": 14.43
+    },
+    "Random Forest": {
+        "RMSE": 24.16,
+        "MAE": 18.75
+    },
+    "LSTM": {
+        "RMSE": 32.8,
+        "MAE": 22.46
+    }
+}

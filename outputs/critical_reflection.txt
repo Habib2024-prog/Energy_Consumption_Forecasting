@@ -1,0 +1,42 @@
+
+╔══════════════════════════════════════════════════════════════╗
+║          CRITICAL REFLECTION (DS401 Requirement)            ║
+╚══════════════════════════════════════════════════════════════╝
+
+1. LIMITATIONS
+   ─────────────────────────────────────────────────────────
+   • Dataset covers only ONE household in Belgium — results
+     may not generalize to other climates or building types.
+   • Only 4.5 months of data — seasonal patterns (summer/winter)
+     are not fully captured.
+   • Appliance-level breakdown is unavailable — we predict
+     total consumption, not per-device usage.
+   • LSTM training is sensitive to hyperparameters — different
+     seeds or architectures may yield different results.
+
+2. ASSUMPTIONS
+   ─────────────────────────────────────────────────────────
+   • Energy consumption patterns are assumed to be stationary
+     enough for a fixed train/test split.
+   • Lag features assume past consumption is a strong predictor
+     of future consumption (autocorrelation assumption).
+   • K=3 clusters (Low/Medium/High) is a simplification —
+     real usage patterns may be more complex.
+
+3. POTENTIAL BIAS
+   ─────────────────────────────────────────────────────────
+   • The dataset is from a single low-energy building — it may
+     be biased toward low consumption profiles.
+   • Weather data is from the nearest airport — may not reflect
+     exact microclimate at the building location.
+   • Outlier capping may have removed genuine peak usage events
+     (e.g., parties, holidays).
+
+4. NEXT STEPS
+   ─────────────────────────────────────────────────────────
+   • Collect multi-household, multi-year data for robust models.
+   • Experiment with Transformer-based models (e.g., Temporal
+     Fusion Transformer) for longer-range forecasting.
+   • Integrate real-time smart meter API for live predictions.
+   • Perform per-appliance disaggregation using NILM techniques.
+   • Add external calendar features (public holidays, events).
